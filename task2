@@ -1,0 +1,206 @@
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import matplotlib.dates as mdates
+import warnings
+warnings.filterwarnings('ignore')
+import os
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+df = pd.read_csv('/content/sales_data.csv')
+df['Sale_Date'] = pd.to_datetime(df['Sale_Date'])
+weekly = (df.groupby(df['Sale_Date'].dt.to_period('W'))
+            .agg(Sales_Amount=('Sales_Amount', 'sum'),
+                 Num_Transactions=('Sales_Amount', 'count'),
+                 Avg_Discount=('Discount', 'mean'),
+                 Total_Qty=('Quantity_Sold', 'sum'))
+            .reset_index())
+weekly['Sale_Date'] = weekly['Sale_Date'].dt.to_timestamp()
+weekly = weekly.sort_values('Sale_Date').reset_index(drop=True)
+weekly['Week']           = weekly['Sale_Date'].dt.isocalendar().week.astype(int)
+weekly['Month']          = weekly['Sale_Date'].dt.month
+weekly['Quarter']        = weekly['Sale_Date'].dt.quarter
+weekly['WeekIndex']      = np.arange(len(weekly))
+for lag in [1, 2, 3, 4]:
+    weekly[f'lag_{lag}'] = weekly['Sales_Amount'].shift(lag)
+weekly['rolling_mean_4'] = weekly['Sales_Amount'].shift(1).rolling(4).mean()
+weekly['rolling_std_4']  = weekly['Sales_Amount'].shift(1).rolling(4).std()
+weekly.dropna(inplace=True)
+weekly.reset_index(drop=True, inplace=True)
+features = ['Week', 'Month', 'Quarter', 'WeekIndex',
+            'Num_Transactions', 'Avg_Discount', 'Total_Qty',
+            'lag_1', 'lag_2', 'lag_3', 'lag_4',
+            'rolling_mean_4', 'rolling_std_4']
+X = weekly[features]
+y = weekly['Sales_Amount']
+split = int(len(weekly) * 0.8)
+X_train, X_test = X.iloc[:split], X.iloc[split:]
+y_train, y_test = y.iloc[:split], y.iloc[split:]
+models = {
+    'Random Forest':     RandomForestRegressor(n_estimators=300, max_depth=10, min_samples_leaf=2, random_state=42),
+    'Gradient Boosting': GradientBoostingRegressor(n_estimators=300, max_depth=4, learning_rate=0.05, random_state=42),
+    'Linear Regression': LinearRegression(),
+}
+scaler = StandardScaler()
+X_tr_sc = scaler.fit_transform(X_train)
+X_te_sc = scaler.transform(X_test)
+results = {}
+for name, model in models.items():
+    Xtr = X_tr_sc if name == 'Linear Regression' else X_train
+    Xte = X_te_sc if name == 'Linear Regression' else X_test
+    model.fit(Xtr, y_train)
+    preds = model.predict(Xte)
+    mae  = mean_absolute_error(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    r2   = r2_score(y_test, preds)
+    results[name] = {'model': model, 'preds': preds, 'MAE': mae, 'RMSE': rmse, 'R2': r2}
+    print(f"{name:25s} → MAE: ${mae:,.0f}  RMSE: ${rmse:,.0f}  R²: {r2:.4f}")
+best_name = max(results, key=lambda n: results[n]['R2'])
+best      = results[best_name]
+print(f"\n✅ Best model: {best_name}  (R² = {best['R2']:.4f})")
+history = list(weekly['Sales_Amount'].values)
+history_dates = list(weekly['Sale_Date'].values)
+forecast_preds = []
+forecast_dates = []
+cur_row = weekly.iloc[-1].copy()
+for i in range(12):
+    next_date = pd.Timestamp(history_dates[-1]) + pd.Timedelta(weeks=1)
+    history_series = pd.Series(history)
+    row = {
+        'Week':            next_date.isocalendar()[1],
+        'Month':           next_date.month,
+        'Quarter':         (next_date.month - 1) // 3 + 1,
+        'WeekIndex':       weekly['WeekIndex'].iloc[-1] + i + 1,
+        'Num_Transactions': weekly['Num_Transactions'].mean(),
+        'Avg_Discount':    weekly['Avg_Discount'].mean(),
+        'Total_Qty':       weekly['Total_Qty'].mean(),
+        'lag_1': history[-1],
+        'lag_2': history[-2],
+        'lag_3': history[-3],
+        'lag_4': history[-4],
+        'rolling_mean_4': np.mean(history[-4:]),
+        'rolling_std_4':  np.std(history[-4:]),
+    }
+    X_fut = pd.DataFrame([row])[features]
+    if best_name == 'Linear Regression':
+        pred = best['model'].predict(scaler.transform(X_fut))[0]
+    else:
+        pred = best['model'].predict(X_fut)[0]
+
+    forecast_preds.append(pred)
+    forecast_dates.append(next_date)
+    history.append(pred)
+    history_dates.append(next_date)
+os.makedirs('/mnt/user-data/outputs', exist_ok=True)
+forecast_df = pd.DataFrame({'Date': forecast_dates, 'Forecasted_Sales': np.array(forecast_preds).round(2)})
+forecast_df.to_csv('/mnt/user-data/outputs/sales_forecast_12weeks.csv', index=False)
+if hasattr(best['model'], 'feature_importances_'):
+    fi = pd.Series(best['model'].feature_importances_, index=features).sort_values(ascending=False)
+else:
+    coef = pd.Series(np.abs(best['model'].coef_), index=features)
+    fi = coef / coef.sum()
+    fi = fi.sort_values(ascending=False)
+P = {
+    'bg': '#0d0f1a', 'panel': '#161928', 'accent1': '#7c6fff',
+    'accent2': '#ff6b8a', 'accent3': '#3ddbac', 'accent4': '#fbbf24',
+    'text': '#e8eaf0', 'sub': '#7a8299', 'grid': '#242840'
+}
+
+def style(ax, title='', xlabel='', ylabel=''):
+    ax.set_facecolor(P['panel'])
+    for sp in ax.spines.values(): sp.set_edgecolor(P['grid'])
+    ax.tick_params(colors=P['sub'], labelsize=8)
+    ax.xaxis.label.set_color(P['sub']); ax.yaxis.label.set_color(P['sub'])
+    ax.grid(True, color=P['grid'], lw=0.5, ls='--')
+    if title:  ax.set_title(title,  color=P['text'], fontsize=10, fontweight='bold', pad=8)
+    if xlabel: ax.set_xlabel(xlabel, fontsize=8)
+    if ylabel: ax.set_ylabel(ylabel, fontsize=8)
+
+fig = plt.figure(figsize=(18, 14), facecolor=P['bg'])
+gs  = GridSpec(3, 3, figure=fig, hspace=0.48, wspace=0.35,
+               left=0.06, right=0.97, top=0.92, bottom=0.06)
+ax1 = fig.add_subplot(gs[0, :2])
+ax1.fill_between(weekly['Sale_Date'], weekly['Sales_Amount'], color=P['accent1'], alpha=0.2)
+ax1.plot(weekly['Sale_Date'], weekly['Sales_Amount'], color=P['accent1'], lw=2, marker='o', ms=4)
+style(ax1, '📈 Weekly Actual Sales (Historical)', ylabel='Weekly Revenue ($)')
+ax1.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+ax2 = fig.add_subplot(gs[0, 2])
+names_list = list(results.keys())
+r2_vals    = [results[n]['R2'] for n in names_list]
+bar_colors = [P['accent3'] if n == best_name else P['accent1'] for n in names_list]
+hbars = ax2.barh(names_list, r2_vals, color=bar_colors, edgecolor=P['bg'], height=0.5)
+for bar, val in zip(hbars, r2_vals):
+    ax2.text(max(bar.get_width() - 0.05, 0.02), bar.get_y() + bar.get_height()/2,
+             f'{val:.3f}', va='center', ha='right' if val > 0.1 else 'left',
+             color=P['bg'] if val > 0.1 else P['text'], fontsize=9, fontweight='bold')
+style(ax2, '🏆 Model R² Score', xlabel='R²')
+ax2.set_xlim(0, 1); ax2.invert_yaxis()
+ax3 = fig.add_subplot(gs[1, :2])
+test_dates_plot = weekly['Sale_Date'].iloc[split:].values
+ax3.plot(test_dates_plot, y_test.values, color=P['sub'],    lw=2, marker='o', ms=5, label='Actual',    alpha=0.8)
+ax3.plot(test_dates_plot, best['preds'], color=P['accent2'], lw=2, marker='s', ms=5, label=f'{best_name}', alpha=0.9, ls='--')
+style(ax3, '🎯 Actual vs Predicted — Test Set', ylabel='Weekly Revenue ($)')
+ax3.legend(facecolor=P['panel'], edgecolor=P['grid'], labelcolor=P['text'], fontsize=8)
+ax3.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+ax4 = fig.add_subplot(gs[1, 2])
+ax4.axis('off')
+ax4.set_title('📊 Model Performance Metrics', color=P['text'], fontsize=10, fontweight='bold', pad=8)
+col_labels = ['Model', 'MAE', 'RMSE', 'R²']
+tdata = [[n, f"${results[n]['MAE']:,.0f}", f"${results[n]['RMSE']:,.0f}", f"{results[n]['R2']:.4f}"]
+         for n in names_list]
+tbl = ax4.table(cellText=tdata, colLabels=col_labels, cellLoc='center', loc='center')
+tbl.auto_set_font_size(False); tbl.set_fontsize(8.5)
+for (r, c), cell in tbl.get_celld().items():
+    if r == 0:
+        cell.set_facecolor(P['accent1']); cell.set_text_props(color=P['bg'], fontweight='bold')
+    elif tdata[r-1][0] == best_name:
+        cell.set_facecolor(P['accent3'] + '44'); cell.set_text_props(color=P['text'])
+    else:
+        cell.set_facecolor(P['panel']); cell.set_text_props(color=P['text'])
+    cell.set_edgecolor(P['grid'])
+tbl.scale(1, 1.9)
+ax5 = fig.add_subplot(gs[2, :2])
+tail_wk = weekly.tail(12)
+ax5.plot(tail_wk['Sale_Date'], tail_wk['Sales_Amount'],
+         color=P['sub'], lw=2, marker='o', ms=5, label='Historical', alpha=0.8)
+ax5.plot(forecast_dates, forecast_preds,
+         color=P['accent4'], lw=2.5, marker='D', ms=5, ls='--', label='12-Week Forecast')
+ax5.fill_between(forecast_dates,
+                 np.array(forecast_preds)*0.85, np.array(forecast_preds)*1.15,
+                 color=P['accent4'], alpha=0.15, label='±15% band')
+ax5.axvline(weekly['Sale_Date'].max(), color=P['accent2'], lw=1.2, ls=':', alpha=0.8)
+ax5.text(weekly['Sale_Date'].max(), ax5.get_ylim()[0]*1.02, '  Forecast\n  Start →',
+         color=P['accent2'], fontsize=7.5, va='bottom')
+style(ax5, f'🔮 12-Week Sales Forecast ({best_name})', ylabel='Weekly Revenue ($)')
+ax5.legend(facecolor=P['panel'], edgecolor=P['grid'], labelcolor=P['text'], fontsize=8)
+ax5.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+ax5.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+ax6 = fig.add_subplot(gs[2, 2])
+top = fi.head(8)
+bars6 = ax6.barh(top.index[::-1], top.values[::-1],
+                 color=[P['accent3'] if 'lag' in i or 'rolling' in i else P['accent1'] for i in top.index[::-1]],
+                 edgecolor=P['bg'])
+style(ax6, '🔑 Top Feature Importances', xlabel='Importance Score')
+fig.text(0.5, 0.975, 'Sales Forecasting ML Dashboard', ha='center', va='top',
+         color=P['text'], fontsize=15, fontweight='bold')
+fig.text(0.5, 0.955,
+         f'Best Model: {best_name}  |  R²={best["R2"]:.4f}  |  '
+         f'Test MAE=${best["MAE"]:,.0f}  |  12-Week Total Forecast: ${sum(forecast_preds):,.0f}',
+         ha='center', va='top', color=P['sub'], fontsize=9.5)
+
+plt.savefig('/mnt/user-data/outputs/sales_forecast_dashboard.png',
+            dpi=150, bbox_inches='tight', facecolor=P['bg'])
+
+print("✅ Dashboard saved.")
+print(f"\n📊 12-Week Forecast Summary:")
+print(f"   Total Revenue:  ${sum(forecast_preds):,.0f}")
+print(f"   Weekly Average: ${np.mean(forecast_preds):,.0f}")
+print(f"   Peak Week:      ${max(forecast_preds):,.0f}")
+print(f"   Lowest Week:    ${min(forecast_preds):,.0f}")
